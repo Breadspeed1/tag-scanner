@@ -24,22 +24,11 @@
 
         <!-- Controls -->
         <section class="card" id="controls">
-            <div class="input-row">
-                <div class="input-group">
-                    <label>Reference QR Image</label>
-                    <input type="file" accept="image/*" @change="onRefChange($event)">
-                    <div class="preview-box">
-                        <img :src="refPreviewSrc" x-show="refLoaded" alt="Reference QR preview">
-                        <span class="preview-placeholder" x-show="!refLoaded">No image loaded</span>
-                    </div>
-                </div>
-
-                <div class="input-group">
+            <div class="input-group">
                     <label>Scene Image</label>
                     <input type="file" accept="image/*" @change="onSceneChange($event)">
                     <p class="input-hint">Upload a photo containing cards with QR codes.</p>
                 </div>
-            </div>
 
             <div class="action-row">
                 <button @click="runDetection" :disabled="!canDetect">
@@ -50,12 +39,84 @@
             </div>
         </section>
 
-        <!-- Scene canvas -->
+        <!-- Tuning panel -->
+        <section class="card" x-show="sceneLoaded" x-cloak>
+            <h2>Detection Tuning <span class="tuning-hint">preview updates live — click Run Detection to apply</span></h2>
+            <div class="tuning-grid">
+
+                <div class="tuning-row">
+                    <label>Tile size</label>
+                    <input type="range" min="400" max="2048" step="50"
+                           x-model.number="params.tileSize" @input="onParamChange()">
+                    <span class="tuning-val" x-text="params.tileSize + 'px'"></span>
+                    <span class="tuning-note">smaller = more tiles, higher recall</span>
+                </div>
+
+                <div class="tuning-row">
+                    <label>Upscale</label>
+                    <input type="range" min="1" max="3" step="0.25"
+                           x-model.number="params.upscale" @input="onParamChange()">
+                    <span class="tuning-val" x-text="params.upscale.toFixed(2) + '×'"></span>
+                    <span class="tuning-note">per-tile upscale before detection</span>
+                </div>
+
+                <div class="tuning-row">
+                    <label>Contrast</label>
+                    <input type="range" min="0.5" max="3" step="0.1"
+                           x-model.number="params.contrast" @input="onParamChange()">
+                    <span class="tuning-val" x-text="params.contrast.toFixed(1) + '×'"></span>
+                    <span class="tuning-note">pixel intensity scale</span>
+                </div>
+
+                <div class="tuning-row">
+                    <label>Brightness</label>
+                    <input type="range" min="-80" max="80" step="5"
+                           x-model.number="params.brightness" @input="onParamChange()">
+                    <span class="tuning-val" x-text="(params.brightness > 0 ? '+' : '') + params.brightness"></span>
+                    <span class="tuning-note">global offset</span>
+                </div>
+
+                <div class="tuning-row">
+                    <label>Sharpen</label>
+                    <input type="range" min="0" max="1.5" step="0.1"
+                           x-model.number="params.sharpen" @input="onParamChange()">
+                    <span class="tuning-val" x-text="params.sharpen.toFixed(1)"></span>
+                    <span class="tuning-note">unsharp mask</span>
+                </div>
+
+                <div class="tuning-row">
+                    <label>Block size</label>
+                    <input type="range" min="11" max="201" step="2"
+                           x-model.number="params.blockSize" @input="onParamChange()">
+                    <span class="tuning-val" x-text="params.blockSize"></span>
+                    <span class="tuning-note">adaptive threshold neighborhood</span>
+                </div>
+
+                <div class="tuning-row">
+                    <label>Threshold C</label>
+                    <input type="range" min="1" max="25" step="1"
+                           x-model.number="params.cVal" @input="onParamChange()">
+                    <span class="tuning-val" x-text="params.cVal"></span>
+                    <span class="tuning-note">subtract from local mean</span>
+                </div>
+
+            </div>
+        </section>
+
+        <!-- Preprocessed — main tuning view with tile grid + detection overlays -->
         <section class="card" x-show="sceneLoaded">
-            <h2>Scene</h2>
+            <h2>Preprocessed <span class="tuning-hint">yellow = tiles &nbsp;|&nbsp; green = QR &nbsp;|&nbsp; blue = SKU region</span></h2>
+            <div class="canvas-wrapper">
+                <canvas id="preprocessed-canvas"></canvas>
+                <canvas id="overlay-canvas"></canvas>
+            </div>
+        </section>
+
+        <!-- Original scene (reference, no overlay) -->
+        <section class="card" x-show="sceneLoaded">
+            <h2>Original</h2>
             <div class="canvas-wrapper">
                 <canvas id="scene-canvas"></canvas>
-                <canvas id="overlay-canvas"></canvas>
             </div>
         </section>
 
@@ -70,7 +131,7 @@
                     <tr>
                         <th>#</th>
                         <th>SKU</th>
-                        <th>Inliers</th>
+                        <th>QR Content</th>
                     </tr>
                 </thead>
                 <tbody>
@@ -78,55 +139,15 @@
                         <tr>
                             <td x-text="i + 1"></td>
                             <td>
-                                <span x-show="card.text" x-text="card.text" class="sku-text"></span>
-                                <span x-show="!card.text && card.pending" class="sku-pending">Reading…</span>
-                                <span x-show="!card.text && !card.pending && card.text !== ''" class="sku-empty">—</span>
+                                <span x-show="card.pending" class="sku-pending">Reading…</span>
+                                <span x-show="!card.pending && card.text" x-text="card.text" class="sku-text"></span>
+                                <span x-show="!card.pending && !card.text" class="sku-empty">—</span>
                             </td>
-                            <td x-text="card.inlierCount" class="col-inliers"></td>
+                            <td x-text="card.decoded || '—'" class="sku-text"></td>
                         </tr>
                     </template>
                 </tbody>
             </table>
-        </section>
-
-        <!-- Debug images -->
-        <section class="card" x-show="debugVisible">
-            <h2>Debug</h2>
-            <div class="debug-grid">
-
-                <div class="debug-item">
-                    <p class="debug-label">
-                        Reference keypoints
-                        <span class="debug-count" x-text="`(${debugStats.refPoints})`"></span>
-                    </p>
-                    <canvas id="debug-ref-kp" class="debug-canvas"></canvas>
-                </div>
-
-                <div class="debug-item">
-                    <p class="debug-label">
-                        Scene keypoints
-                        <span class="debug-count" x-text="`(${debugStats.scenePoints})`"></span>
-                    </p>
-                    <canvas id="debug-scene-kp" class="debug-canvas"></canvas>
-                </div>
-
-                <div class="debug-item">
-                    <p class="debug-label">
-                        Good matches after Lowe ratio test
-                        <span class="debug-count" x-text="`(${debugStats.goodMatches})`"></span>
-                    </p>
-                    <canvas id="debug-matches" class="debug-canvas"></canvas>
-                </div>
-
-                <div class="debug-item">
-                    <p class="debug-label">
-                        DBSCAN clusters
-                        <span class="debug-count" x-text="`(${debugStats.clusters} cluster${debugStats.clusters !== 1 ? 's' : ''}, grey = noise)`"></span>
-                    </p>
-                    <canvas id="debug-clusters" class="debug-canvas"></canvas>
-                </div>
-
-            </div>
         </section>
 
         <!-- Log -->

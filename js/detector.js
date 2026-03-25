@@ -1,240 +1,256 @@
-import { DETECTION, CARD_LAYOUT } from './config.js';
-import { dbscan } from './clustering.js';
+import { CARD_LAYOUT } from './config.js';
 
-// Persistent OpenCV objects (created once, reused per run).
-let akaze = null;
-let matcher = null;
+let qrDetector = null;
 
-// Reference data (computed once).
-let refDescriptors = null;
-let refKeypoints = null;
-let refWidth = 0;
-let refHeight = 0;
-
-export function initReference(refImage) {
-    if (akaze) { akaze.delete(); akaze = null; }
-    if (matcher) { matcher.delete(); matcher = null; }
-    if (refDescriptors) { refDescriptors.delete(); refDescriptors = null; }
-    if (refKeypoints) { refKeypoints.delete(); refKeypoints = null; }
-
-    akaze = new cv.AKAZE();
-    akaze.setThreshold(DETECTION.akaze_threshold);
-    matcher = new cv.BFMatcher(cv.NORM_HAMMING);
-
-    const refMat = cv.imread(refImage);
-    const refGray = new cv.Mat();
-    cv.cvtColor(refMat, refGray, cv.COLOR_RGBA2GRAY);
-    refWidth = refGray.cols;
-    refHeight = refGray.rows;
-
-    refKeypoints = new cv.KeyPointVector();
-    refDescriptors = new cv.Mat();
-    const mask = new cv.Mat();
-    akaze.detectAndCompute(refGray, mask, refKeypoints, refDescriptors);
-
-    refMat.delete();
-    refGray.delete();
-    mask.delete();
-}
-
-export function getRefInfo() {
-    return {
-        keypointCount: refKeypoints ? refKeypoints.size() : 0,
-        width: refWidth,
-        height: refHeight,
-    };
-}
-
-/** Extract all keypoint positions from a KeyPointVector into a plain JS array. */
-function extractKpPositions(kv) {
-    const pts = [];
-    for (let i = 0; i < kv.size(); i++) {
-        const kp = kv.get(i);
-        pts.push({ x: kp.pt.x, y: kp.pt.y });
-    }
-    return pts;
+export function initDetector() {
+    if (qrDetector) qrDetector.delete();
+    qrDetector = new cv.QRCodeDetector();
 }
 
 /**
- * Run the full detection pipeline.
+ * Detect all QR codes in a scene.
  *
- * Returns { cards, debug } where debug always contains intermediate data
- * regardless of whether cards were found, to enable visualization.
+ * Preprocessing (adaptive threshold) runs on the FULL image in one pass so
+ * every pixel has consistent neighborhood context — no tile-boundary artifacts.
+ * The tiling is only for the QR detector, which struggles with many small codes
+ * in a large image but handles small regions well.
  *
- * debug shape:
- * {
- *   refPoints:    [{x,y}]          — all reference keypoints
- *   scenePoints:  [{x,y}]          — all scene keypoints (after detectAndCompute)
- *   goodMatches:  [{refPt,scenePt}] — after Lowe ratio test
- *   labels:       Int32Array|null   — DBSCAN cluster label per goodMatch (-1 = noise)
- * }
+ * @param {cv.Mat} sceneMat  - RGBA scene image (detection-canvas resolution)
+ * @param {object} params    - { tileSize, upscale, contrast, brightness, sharpen, blockSize, cVal }
+ * @returns {{ cards: DetectedCard[], tileCount: number }}
  */
-export function detect(sceneMat) {
-    const debug = {
-        refPoints:   extractKpPositions(refKeypoints ?? new cv.KeyPointVector()),
-        scenePoints: [],
-        goodMatches: [],
-        labels:      null,
-    };
+export function detect(sceneMat, params = {}) {
+    const { tileSize = 1000, upscale = 1 } = params;
 
-    if (!akaze || !refDescriptors) return { cards: [], debug };
+    // Global preprocessing on full image — adaptive threshold sees full context.
+    const baseGray = preprocessBase(sceneMat, params);
+    const fullBin  = preprocessLocal(baseGray, params);
 
-    // --- Stage 1: Feature extraction ---
-    const sceneGray = new cv.Mat();
-    try {
-        cv.cvtColor(sceneMat, sceneGray, cv.COLOR_RGBA2GRAY);
-    } catch (e) {
-        sceneGray.delete();
-        throw Object.assign(new Error('stage1: cvtColor'), { cause: e });
-    }
+    const W = fullBin.cols;
+    const H = fullBin.rows;
 
-    const sceneKeypoints = new cv.KeyPointVector();
-    const sceneDescriptors = new cv.Mat();
-    const emptyMask = new cv.Mat();
-    try {
-        akaze.detectAndCompute(sceneGray, emptyMask, sceneKeypoints, sceneDescriptors);
-    } catch (e) {
-        sceneGray.delete(); sceneKeypoints.delete(); sceneDescriptors.delete(); emptyMask.delete();
-        throw Object.assign(new Error('stage1: detectAndCompute (scene)'), { cause: e });
-    }
-    emptyMask.delete();
+    const overlap = Math.round(tileSize * 0.5);
+    const step    = tileSize - overlap;
+    const rawHits = [];
+    let tileCount = 0;
 
-    // Capture scene keypoints for debug before any early return
-    debug.scenePoints = extractKpPositions(sceneKeypoints);
+    for (let ty = 0; ty < H; ty += step) {
+        for (let tx = 0; tx < W; tx += step) {
+            const tw = Math.min(tileSize, W - tx);
+            const th = Math.min(tileSize, H - ty);
+            tileCount++;
 
-    if (sceneDescriptors.rows < DETECTION.min_inliers) {
-        sceneGray.delete(); sceneKeypoints.delete(); sceneDescriptors.delete();
-        return { cards: [], debug };
-    }
+            // ROI from the already-preprocessed binary image — no clone needed
+            // since there is no further neighborhood operation on these tiles.
+            const roi = fullBin.roi(new cv.Rect(tx, ty, tw, th));
 
-    // --- Stage 2: Descriptor matching + ratio test ---
-    const rawMatches = new cv.DMatchVectorVector();
-    try {
-        matcher.knnMatch(refDescriptors, sceneDescriptors, rawMatches, 2);
-    } catch (e) {
-        sceneGray.delete(); sceneKeypoints.delete(); sceneDescriptors.delete(); rawMatches.delete();
-        throw Object.assign(new Error('stage2: knnMatch'), { cause: e });
-    }
+            let detectMat = roi;
+            if (upscale > 1) {
+                detectMat = new cv.Mat();
+                cv.resize(roi, detectMat, new cv.Size(
+                    Math.round(tw * upscale), Math.round(th * upscale)
+                ), 0, 0, cv.INTER_LINEAR);
+            }
 
-    const goodMatches = [];
-    for (let i = 0; i < rawMatches.size(); i++) {
-        const pair = rawMatches.get(i);
-        if (pair.size() < 2) continue;
-        const m = pair.get(0);
-        const n = pair.get(1);
-        if (m.distance < DETECTION.lowe_ratio * n.distance) {
-            goodMatches.push({
-                refPt:   keypointToPoint(refKeypoints, m.queryIdx),
-                scenePt: keypointToPoint(sceneKeypoints, m.trainIdx),
+            const hits = _detectInMat(detectMat);
+            if (upscale > 1) detectMat.delete();
+            roi.delete();
+
+            const inv = 1 / upscale;
+            hits.forEach(({ qrCorners, decoded }) => {
+                rawHits.push({
+                    qrCorners: qrCorners.map(p => ({ x: p.x * inv + tx, y: p.y * inv + ty })),
+                    decoded,
+                });
             });
         }
     }
 
-    rawMatches.delete();
-    sceneDescriptors.delete();
+    fullBin.delete();
 
-    // Capture good matches before early return
-    debug.goodMatches = goodMatches;
+    const unique = _deduplicate(rawHits, tileSize * 0.1);
 
-    if (goodMatches.length < DETECTION.min_inliers) {
-        sceneGray.delete(); sceneKeypoints.delete();
-        return { cards: [], debug };
-    }
+    // Use baseGray (pre-binary) for SKU crop extraction — better for Otsu OCR.
+    const cards = unique.map(({ qrCorners, decoded }) => {
+        const topLen  = Math.hypot(qrCorners[1].x - qrCorners[0].x, qrCorners[1].y - qrCorners[0].y);
+        const leftLen = Math.hypot(qrCorners[3].x - qrCorners[0].x, qrCorners[3].y - qrCorners[0].y);
+        const qrSize  = (topLen + leftLen) / 2;
 
-    // --- Stage 3: Spatial clustering ---
-    const scenePts = goodMatches.map(m => m.scenePt);
-    const labels = dbscan(scenePts, DETECTION.dbscan_eps, DETECTION.dbscan_min_samples);
-    debug.labels = labels;
-
-    // --- Stage 4: Per-cluster homography + crop ---
-    const clusterIds = [...new Set(labels.filter(l => l >= 0))].sort((a, b) => a - b);
-    const cards = [];
-
-    for (const clusterId of clusterIds) {
-        const clusterMatches = goodMatches.filter((_, i) => labels[i] === clusterId);
-        if (clusterMatches.length < 4) continue;
-
-        const srcPts = cv.matFromArray(clusterMatches.length, 1, cv.CV_32FC2,
-            clusterMatches.flatMap(m => [m.refPt.x, m.refPt.y]));
-        const dstPts = cv.matFromArray(clusterMatches.length, 1, cv.CV_32FC2,
-            clusterMatches.flatMap(m => [m.scenePt.x, m.scenePt.y]));
-
-        const mask = new cv.Mat();
-        const H = cv.findHomography(srcPts, dstPts, cv.RANSAC, DETECTION.ransac_reproj_thresh, mask);
-        srcPts.delete();
-        dstPts.delete();
-
-        if (H.empty()) { H.delete(); mask.delete(); continue; }
-
-        let inlierCount = 0;
-        for (let i = 0; i < mask.rows; i++) {
-            if (mask.data[i] !== 0) inlierCount++;
-        }
-        mask.delete();
-
-        if (inlierCount < DETECTION.min_inliers) { H.delete(); continue; }
-
-        const qrCornersRef = [[0,0],[refWidth,0],[refWidth,refHeight],[0,refHeight]];
-        const qrCorners = transformPoints(qrCornersRef, H);
-
-        const sx = CARD_LAYOUT.sku_x * refWidth;
-        const sy = CARD_LAYOUT.sku_y * refHeight;
-        const sw = CARD_LAYOUT.sku_w * refWidth;
-        const sh = CARD_LAYOUT.sku_h * refHeight;
-        const skuCorners = transformPoints([[sx,sy],[sx+sw,sy],[sx+sw,sy+sh],[sx,sy+sh]], H);
-
-        const center = {
-            x: qrCorners.reduce((s, p) => s + p.x, 0) / 4,
-            y: qrCorners.reduce((s, p) => s + p.y, 0) / 4,
+        const axisX = {
+            x: (qrCorners[1].x - qrCorners[0].x) / topLen,
+            y: (qrCorners[1].y - qrCorners[0].y) / topLen,
+        };
+        const axisY = {
+            x: (qrCorners[3].x - qrCorners[0].x) / leftLen,
+            y: (qrCorners[3].y - qrCorners[0].y) / leftLen,
         };
 
-        cards.push({
-            homography: H,
-            inlierCount,
-            center,
+        const skuCorners = computeSkuCorners(qrCorners[0], axisX, axisY, qrSize);
+        const center = {
+            x: (qrCorners[0].x + qrCorners[1].x + qrCorners[2].x + qrCorners[3].x) / 4,
+            y: (qrCorners[0].y + qrCorners[1].y + qrCorners[2].y + qrCorners[3].y) / 4,
+        };
+
+        return {
             qrCorners,
             skuCorners,
-            skuCrop: extractCrop(sceneGray, skuCorners),
-        });
+            center,
+            skuCrop: extractCrop(baseGray, skuCorners),
+            decoded,
+        };
+    });
+
+    baseGray.delete();
+    return { cards, tileCount };
+}
+
+/**
+ * Global preprocessing: RGBA → grayscale → contrast/brightness → sharpen.
+ * Safe to run on the full image; no large-neighborhood operations.
+ * Exported for use in the preview renderer.
+ */
+export function preprocessBase(sceneMat, params = {}) {
+    const { contrast = 1, brightness = 0, sharpen = 0 } = params;
+
+    const gray = new cv.Mat();
+    cv.cvtColor(sceneMat, gray, cv.COLOR_RGBA2GRAY);
+
+    let working = new cv.Mat();
+    cv.convertScaleAbs(gray, working, contrast, brightness);
+    gray.delete();
+
+    if (sharpen > 0) {
+        const k = cv.matFromArray(3, 3, cv.CV_32F, [
+            0, -sharpen, 0,
+            -sharpen, 1 + 4 * sharpen, -sharpen,
+            0, -sharpen, 0,
+        ]);
+        const sharpened = new cv.Mat();
+        cv.filter2D(working, sharpened, -1, k);
+        k.delete();
+        working.delete();
+        working = sharpened;
     }
 
-    sceneGray.delete();
-    sceneKeypoints.delete();
+    return working;
+}
 
-    return { cards, debug };
+/**
+ * Local preprocessing: adaptive threshold + morphological close.
+ * Should be called on the full image (or a standalone clone) for consistent results.
+ * Exported for use in the preview renderer.
+ */
+export function preprocessLocal(grayMat, params = {}) {
+    const { blockSize = 51, cVal = 10 } = params;
+
+    const binary = new cv.Mat();
+    cv.adaptiveThreshold(
+        grayMat, binary, 255,
+        cv.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv.THRESH_BINARY,
+        blockSize,
+        cVal,
+    );
+
+    const kernel = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(3, 3));
+    const closed = new cv.Mat();
+    cv.morphologyEx(binary, closed, cv.MORPH_CLOSE, kernel);
+    kernel.delete();
+    binary.delete();
+
+    return closed;
 }
 
 
 // --- Internal helpers ---
 
-function keypointToPoint(keypoints, idx) {
-    const kp = keypoints.get(idx);
-    return { x: kp.pt.x, y: kp.pt.y };
+function _detectInMat(mat) {
+    const points  = new cv.Mat();
+    const decoded = new cv.StringVector();
+    let found = false;
+
+    try {
+        found = qrDetector.detectAndDecodeMulti(mat, decoded, points);
+    } catch (_) {
+        try {
+            found = qrDetector.detectMulti(mat, points);
+        } catch (e2) {
+            points.delete(); decoded.delete();
+            throw Object.assign(new Error('QR detectMulti failed'), { cause: e2 });
+        }
+    }
+
+    if (!found || points.empty()) {
+        points.delete(); decoded.delete();
+        return [];
+    }
+
+    const floats = points.data32F;
+    const numQR  = floats.length / 8;
+    const results = [];
+
+    for (let q = 0; q < numQR; q++) {
+        const b = q * 8;
+        results.push({
+            qrCorners: [
+                { x: floats[b],     y: floats[b + 1] },
+                { x: floats[b + 2], y: floats[b + 3] },
+                { x: floats[b + 4], y: floats[b + 5] },
+                { x: floats[b + 6], y: floats[b + 7] },
+            ],
+            decoded: decoded.size() > q ? decoded.get(q) : '',
+        });
+    }
+
+    points.delete();
+    decoded.delete();
+    return results;
 }
 
-function transformPoints(pts, H) {
-    const src = cv.matFromArray(pts.length, 1, cv.CV_32FC2, pts.flatMap(([x, y]) => [x, y]));
-    const dst = new cv.Mat();
-    cv.perspectiveTransform(src, dst, H);
-    const result = [];
-    for (let i = 0; i < pts.length; i++) {
-        result.push({ x: dst.floatAt(i, 0), y: dst.floatAt(i, 1) });
+function _deduplicate(detections, threshold) {
+    const kept = [];
+    for (const det of detections) {
+        const cx = (det.qrCorners[0].x + det.qrCorners[1].x + det.qrCorners[2].x + det.qrCorners[3].x) / 4;
+        const cy = (det.qrCorners[0].y + det.qrCorners[1].y + det.qrCorners[2].y + det.qrCorners[3].y) / 4;
+        const dup = kept.some(k => {
+            const kx = (k.qrCorners[0].x + k.qrCorners[1].x + k.qrCorners[2].x + k.qrCorners[3].x) / 4;
+            const ky = (k.qrCorners[0].y + k.qrCorners[1].y + k.qrCorners[2].y + k.qrCorners[3].y) / 4;
+            return Math.hypot(cx - kx, cy - ky) < threshold;
+        });
+        if (!dup) kept.push(det);
     }
-    src.delete();
-    dst.delete();
-    return result;
+    return kept;
+}
+
+function computeSkuCorners(origin, axisX, axisY, qrSize) {
+    const { sku_x, sku_y, sku_w, sku_h } = CARD_LAYOUT;
+
+    function toScene(lx, ly) {
+        return {
+            x: origin.x + (lx * qrSize) * axisX.x + (ly * qrSize) * axisY.x,
+            y: origin.y + (lx * qrSize) * axisX.y + (ly * qrSize) * axisY.y,
+        };
+    }
+
+    return [
+        toScene(sku_x,         sku_y),
+        toScene(sku_x + sku_w, sku_y),
+        toScene(sku_x + sku_w, sku_y + sku_h),
+        toScene(sku_x,         sku_y + sku_h),
+    ];
 }
 
 function extractCrop(sceneGray, skuCorners) {
+    const { crop_width, crop_height } = CARD_LAYOUT;
+
     const srcQuad = cv.matFromArray(4, 1, cv.CV_32FC2, skuCorners.flatMap(p => [p.x, p.y]));
     const dstQuad = cv.matFromArray(4, 1, cv.CV_32FC2, [
-        0, 0, CARD_LAYOUT.crop_width, 0,
-        CARD_LAYOUT.crop_width, CARD_LAYOUT.crop_height, 0, CARD_LAYOUT.crop_height,
+        0, 0, crop_width, 0, crop_width, crop_height, 0, crop_height,
     ]);
 
-    const M = cv.getPerspectiveTransform(srcQuad, dstQuad);
+    const M    = cv.getPerspectiveTransform(srcQuad, dstQuad);
     const crop = new cv.Mat();
-    cv.warpPerspective(sceneGray, crop, M, new cv.Size(CARD_LAYOUT.crop_width, CARD_LAYOUT.crop_height));
+    cv.warpPerspective(sceneGray, crop, M, new cv.Size(crop_width, crop_height));
 
     const binary = new cv.Mat();
     cv.threshold(crop, binary, 0, 255, cv.THRESH_BINARY + cv.THRESH_OTSU);

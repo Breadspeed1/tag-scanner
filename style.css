@@ -201,6 +201,22 @@ button.secondary:hover:not(:disabled) {
 .status-badge.warn    { color: var(--yellow); background: rgba(255,215,64,0.08); }
 .status-badge.error   { color: var(--red); background: rgba(255,82,82,0.1); }
 
+/* Side-by-side canvas pair */
+.canvas-pair {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 1rem;
+    align-items: start;
+}
+
+.canvas-col h2 {
+    margin-bottom: 0.5rem;
+}
+
+@media (max-width: 700px) {
+    .canvas-pair { grid-template-columns: 1fr; }
+}
+
 /* Canvas */
 .canvas-wrapper {
     position: relative;
@@ -212,7 +228,8 @@ button.secondary:hover:not(:disabled) {
     background: #000;
 }
 
-#scene-canvas {
+#scene-canvas,
+#preprocessed-canvas {
     display: block;
     max-width: 100%;
     height: auto;
@@ -265,6 +282,61 @@ button.secondary:hover:not(:disabled) {
 .sku-text    { font-family: var(--mono); font-size: 0.95rem; color: var(--green); font-weight: 600; }
 .sku-pending { color: var(--muted); font-style: italic; }
 .sku-empty   { color: var(--muted); }
+
+/* Tuning panel */
+.tuning-hint {
+    font-size: 0.72rem;
+    color: var(--muted);
+    font-weight: 400;
+    text-transform: none;
+    letter-spacing: 0;
+    margin-left: 0.4rem;
+}
+
+.tuning-grid {
+    display: grid;
+    gap: 0.65rem;
+}
+
+.tuning-row {
+    display: grid;
+    grid-template-columns: 90px 1fr 52px 1fr;
+    align-items: center;
+    gap: 0.75rem;
+}
+
+.tuning-row label {
+    font-size: 0.78rem;
+    font-weight: 600;
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+}
+
+.tuning-val {
+    font-family: var(--mono);
+    font-size: 0.82rem;
+    color: var(--accent);
+    text-align: right;
+    white-space: nowrap;
+}
+
+.tuning-note {
+    font-size: 0.72rem;
+    color: var(--muted);
+}
+
+input[type="range"] {
+    accent-color: var(--accent);
+    cursor: pointer;
+    width: 100%;
+    height: 4px;
+}
+
+@media (max-width: 600px) {
+    .tuning-row { grid-template-columns: 80px 1fr 48px; }
+    .tuning-note { display: none; }
+}
 
 /* Debug */
 .debug-grid {

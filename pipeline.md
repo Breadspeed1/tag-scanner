@@ -6,9 +6,9 @@
 
 ## 1. System Overview
 
-A static web application that detects identical QR codes on product cards
-(potentially behind plastic bags), computes each card's pose, extracts a
-rectified crop of the SKU text region, and reads it via OCR.
+A static web application that detects identical QR codes on product cards,
+computes each card's pose from the QR corner points, extracts a rectified
+crop of the SKU text region, and reads it via OCR.
 
 Everything runs client-side. No server required. Deployable to GitHub Pages.
 
@@ -22,13 +22,12 @@ Everything runs client-side. No server required. Deployable to GitHub Pages.
 │  ┌──────────────────────────────────────┐                        │
 │  │  Detection Pipeline (OpenCV.js)      │                        │
 │  │                                      │                        │
-│  │  1. AKAZE detect+compute (ref, once) │                        │
-│  │  2. AKAZE detect+compute (scene)     │                        │
-│  │  3. BFMatcher knnMatch               │                        │
-│  │  4. Ratio test filter                │                        │
-│  │  5. Cluster matches (DBSCAN)         │                        │
-│  │  6. Per cluster: findHomography      │                        │
-│  │  7. Per card: warpPerspective crop   │                        │
+│  │  1. QRCodeDetector.detectMulti       │                        │
+│  │     → 4 corners per QR code          │                        │
+│  │  2. getPerspectiveTransform          │                        │
+│  │     → homography per card            │                        │
+│  │  3. warpPerspective                  │                        │
+│  │     → rectified SKU crop             │                        │
 │  └──────────┬───────────────────────────┘                        │
 │             │                                                    │
 │             ▼                                                    │
@@ -36,13 +35,8 @@ Everything runs client-side. No server required. Deployable to GitHub Pages.
 │  │  Overlay Canvas      │  │  OCR Worker (Tesseract.js)       │  │
 │  │  - QR bounding quads │  │  - Receives crop ImageData       │  │
 │  │  - SKU region quads  │  │  - Returns SKU text              │  │
-│  │  - SKU text labels   │  │  - One-shot per new card         │  │
+│  │  - SKU text labels   │  │  - Runs per detected card        │  │
 │  └──────────────────────┘  └──────────────────────────────────┘  │
-│                                                                  │
-│  Card Tracker                                                    │
-│  - Deduplicates across frames by position                        │
-│  - Caches OCR results                                            │
-│  - Prevents redundant OCR calls                                  │
 └──────────────────────────────────────────────────────────────────┘
 ```
 
@@ -57,13 +51,14 @@ Everything runs client-side. No server required. Deployable to GitHub Pages.
 ├── js/
 │   ├── app.js              # entry point, camera setup, frame loop
 │   ├── detector.js         # OpenCV.js detection pipeline
-│   ├── clustering.js       # DBSCAN (only custom algorithm)
-│   ├── tracker.js          # cross-frame card deduplication
 │   ├── ocr-worker.js       # Web Worker running Tesseract.js
 │   └── config.js           # card layout + detection parameters
 └── assets/
-    └── ref_qr.png          # reference QR code image
+    └── ref_qr.png          # reference QR code image (for layout calibration only)
 ```
+
+No feature matching, clustering, or tracking modules. The QR detector
+gives us corners directly.
 
 ---
 
@@ -73,37 +68,21 @@ Everything runs client-side. No server required. Deployable to GitHub Pages.
 
 ```javascript
 export const CARD_LAYOUT = {
-    // SKU bounding box in QR-side-length units.
-    // QR code occupies [0,0] → [1,1].
-    sku_x: 0.0,
-    sku_y: 1.1,
-    sku_w: 1.0,
-    sku_h: 0.4,
+    // SKU bounding box relative to the QR code's detected corners.
+    // The QR code occupies [0,0] → [1,1] where the unit is the QR
+    // side length. Corners from detectMulti are in order:
+    //   [0] top-left, [1] top-right, [2] bottom-right, [3] bottom-left
+    //
+    // Measure from a physical card: how far is the SKU text from the
+    // QR code, expressed as multiples of the QR side length?
+    sku_x: 0.0,        // left edge relative to QR left
+    sku_y: 1.1,        // top edge relative to QR top (1.1 = just below)
+    sku_w: 1.0,        // width in QR-side-lengths
+    sku_h: 0.4,        // height in QR-side-lengths
 
-    // Output crop resolution (pixels).
+    // Output crop resolution in pixels.
     crop_width: 300,
     crop_height: 100,
-};
-
-export const DETECTION = {
-    // AKAZE
-    akaze_threshold: 0.001,         // detector threshold (lower = more features)
-
-    // Matching
-    lowe_ratio: 0.75,
-
-    // DBSCAN
-    dbscan_eps: 80,                 // px — tune relative to QR size in scene
-    dbscan_min_samples: 8,
-
-    // RANSAC (passed to cv.findHomography)
-    ransac_reproj_thresh: 5.0,
-    min_inliers: 10,
-};
-
-export const TRACKER = {
-    merge_radius: 60,               // px — max distance to consider same card
-    ema_alpha: 0.2,                 // smoothing factor for center position
 };
 
 export const CAMERA = {
@@ -123,21 +102,14 @@ export const OCR_WHITELIST = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-';
 ### 4.1 `app.js` — Entry Point
 
 Responsibilities: load OpenCV.js, set up camera, manage the frame loop,
-coordinate between detector, tracker, and OCR worker.
+coordinate between detector and OCR worker.
 
 ```javascript
-// Lifecycle:
-//
-// 1. Poll for OpenCV.js WASM initialization (loaded via CDN script tag)
-// 2. Load reference image onto a <canvas>, convert to cv.Mat
-// 3. Call detector.initReference(refMat)
-// 4. Open camera via getUserMedia
-// 5. Start frame loop via requestAnimationFrame
-// 6. Initialize Tesseract Web Worker
+import { initDetector, detect } from './detector.js';
+import { CARD_LAYOUT, CAMERA } from './config.js';
 
-let refFeatures = null;   // cached reference AKAZE features
-let tracker = null;       // CardTracker instance
-let ocrWorker = null;     // Web Worker handle
+let ocrWorker = null;
+let detecting = false;
 
 async function waitForOpenCV() {
     while (typeof cv === 'undefined' || typeof cv.Mat === 'undefined') {
@@ -147,8 +119,7 @@ async function waitForOpenCV() {
 
 async function start() {
     await waitForOpenCV();
-    refFeatures = initReference(refImageElement);
-    tracker = new CardTracker(TRACKER);
+    initDetector();
     ocrWorker = new Worker('js/ocr-worker.js');
     ocrWorker.onmessage = handleOCRResult;
     await startCamera();
@@ -156,43 +127,67 @@ async function start() {
 }
 
 function processFrame() {
-    // 1. Capture frame from video to canvas
+    if (detecting) {
+        requestAnimationFrame(processFrame);
+        return;
+    }
+    detecting = true;
+
+    // 1. Capture frame
     ctx.drawImage(video, 0, 0);
-    const imageData = ctx.getImageData(0, 0, width, height);
+    const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
     const sceneMat = cv.matFromImageData(imageData);
 
-    // 2. Run detection
-    const cards = detect(sceneMat, refFeatures);
+    // 2. Detect QR codes + extract crops
+    const cards = detect(sceneMat);
 
-    // 3. Update tracker, dispatch OCR for new cards
+    // 3. Draw overlays
+    overlay.clearRect(0, 0, canvas.width, canvas.height);
     for (const card of cards) {
-        const { id, isNew } = tracker.update(card);
-        if (isNew && card.skuCrop) {
+        drawQuad(overlay, card.qrCorners, '#00ff00', 2);
+        drawQuad(overlay, card.skuCorners, '#4488ff', 2);
+    }
+
+    // 4. Send crops to OCR worker
+    for (let i = 0; i < cards.length; i++) {
+        if (cards[i].skuCrop) {
             ocrWorker.postMessage({
-                cardId: id,
-                cropData: card.skuCrop.data,
+                cardIndex: i,
+                cropData: new Uint8Array(cards[i].skuCrop.data),
                 cropWidth: CARD_LAYOUT.crop_width,
                 cropHeight: CARD_LAYOUT.crop_height,
             });
         }
     }
 
-    // 4. Draw overlays
-    drawOverlays(cards, tracker);
-
-    // 5. Cleanup OpenCV Mats (prevent memory leaks)
+    // 5. Cleanup OpenCV Mats
     sceneMat.delete();
     for (const card of cards) {
         if (card.skuCrop) card.skuCrop.delete();
     }
 
+    detecting = false;
     requestAnimationFrame(processFrame);
 }
 
 function handleOCRResult(event) {
-    const { cardId, text } = event.data;
-    tracker.setText(cardId, text);
+    const { cardIndex, text } = event.data;
+    updateResultsTable(cardIndex, text);
 }
+
+function drawQuad(ctx, corners, color, lineWidth) {
+    ctx.strokeStyle = color;
+    ctx.lineWidth = lineWidth;
+    ctx.beginPath();
+    ctx.moveTo(corners[0].x, corners[0].y);
+    for (let i = 1; i < corners.length; i++) {
+        ctx.lineTo(corners[i].x, corners[i].y);
+    }
+    ctx.closePath();
+    ctx.stroke();
+}
+
+start();
 ```
 
 **Critical: OpenCV.js memory management.** Every `cv.Mat` must be explicitly
@@ -204,199 +199,122 @@ memory and crash the tab within minutes during a camera loop.
 
 ### 4.2 `detector.js` — Detection Pipeline
 
-Two exported functions: `initReference` (called once) and `detect`
-(called per frame).
+The entire detection module. No feature extraction, no matching, no
+clustering. `detectMulti` does the hard work.
 
 ```javascript
-import { DETECTION, CARD_LAYOUT } from './config.js';
-import { dbscan } from './clustering.js';
+import { CARD_LAYOUT } from './config.js';
 
-// Persistent OpenCV objects (created once, reused per frame).
-let akaze = null;
-let matcher = null;
-
-// Reference data (computed once).
-let refDescriptors = null;
-let refKeypoints = null;
-let refWidth = 0;
-let refHeight = 0;
+let qrDetector = null;
 
 /**
- * Initialize AKAZE detector and extract reference features.
- * Called once at startup.
- *
- * @param {HTMLImageElement|HTMLCanvasElement} refImage
- * @returns {void}
+ * Initialize the QR code detector. Called once at startup.
  */
-export function initReference(refImage) {
-    // Create AKAZE detector
-    akaze = new cv.AKAZE();
-    akaze.setThreshold(DETECTION.akaze_threshold);
-
-    // Create brute-force matcher for binary descriptors
-    matcher = new cv.BFMatcher(cv.NORM_HAMMING);
-
-    // Read reference image → grayscale
-    const refMat = cv.imread(refImage);
-    const refGray = new cv.Mat();
-    cv.cvtColor(refMat, refGray, cv.COLOR_RGBA2GRAY);
-
-    refWidth = refGray.cols;
-    refHeight = refGray.rows;
-
-    // Extract features
-    refKeypoints = new cv.KeyPointVector();
-    refDescriptors = new cv.Mat();
-    akaze.detectAndCompute(refGray, new cv.Mat(), refKeypoints, refDescriptors);
-
-    // Cleanup
-    refMat.delete();
-    refGray.delete();
+export function initDetector() {
+    qrDetector = new cv.QRCodeDetector();
 }
 
 /**
- * Run the full detection pipeline on a scene frame.
+ * Detect all QR codes in a scene and extract SKU crops.
  *
- * @param {cv.Mat} sceneMat - RGBA scene image (from matFromImageData)
+ * @param {cv.Mat} sceneMat - RGBA scene image
  * @returns {Array<DetectedCard>}
  *
  * DetectedCard shape:
  * {
- *   homography: cv.Mat (3x3 float64),
- *   inlierCount: number,
- *   center: { x: number, y: number },
  *   qrCorners: [{x,y}, {x,y}, {x,y}, {x,y}],
  *   skuCorners: [{x,y}, {x,y}, {x,y}, {x,y}],
- *   skuCrop: cv.Mat (grayscale u8, crop_width × crop_height),
+ *   skuCrop: cv.Mat | null,  // grayscale, crop_width × crop_height
+ *   decoded: string,          // decoded QR content (bonus — free data)
  * }
  */
 export function detect(sceneMat) {
-    // --- Stage 1: Feature extraction ---
     const sceneGray = new cv.Mat();
     cv.cvtColor(sceneMat, sceneGray, cv.COLOR_RGBA2GRAY);
 
-    const sceneKeypoints = new cv.KeyPointVector();
-    const sceneDescriptors = new cv.Mat();
-    akaze.detectAndCompute(sceneGray, new cv.Mat(), sceneKeypoints, sceneDescriptors);
+    // detectMulti returns decoded strings + corner points for each QR
+    const points = new cv.Mat();
+    const decoded = new cv.StringVector();
 
-    if (sceneDescriptors.rows < DETECTION.min_inliers) {
-        sceneGray.delete();
-        sceneDescriptors.delete();
-        return [];
-    }
-
-    // --- Stage 2: Descriptor matching + ratio test ---
-    const rawMatches = new cv.DMatchVectorVector();
-    matcher.knnMatch(refDescriptors, sceneDescriptors, rawMatches, 2);
-
-    const goodMatches = [];
-    for (let i = 0; i < rawMatches.size(); i++) {
-        const pair = rawMatches.get(i);
-        if (pair.size() < 2) continue;
-        const m = pair.get(0);
-        const n = pair.get(1);
-        if (m.distance < DETECTION.lowe_ratio * n.distance) {
-            goodMatches.push({
-                refIdx: m.queryIdx,
-                sceneIdx: m.trainIdx,
-                refPt: keypointToPoint(refKeypoints, m.queryIdx),
-                scenePt: keypointToPoint(sceneKeypoints, m.trainIdx),
-            });
+    let found = false;
+    try {
+        found = qrDetector.detectAndDecodeMulti(sceneGray, decoded, points);
+    } catch (e) {
+        // detectAndDecodeMulti can throw on some builds.
+        // Fall back to detectMulti (corners only, no decode).
+        try {
+            found = qrDetector.detectMulti(sceneGray, points);
+        } catch (e2) {
+            sceneGray.delete();
+            points.delete();
+            decoded.delete();
+            return [];
         }
     }
 
-    rawMatches.delete();
-    sceneDescriptors.delete();
-
-    if (goodMatches.length < DETECTION.min_inliers) {
+    if (!found || points.empty()) {
         sceneGray.delete();
-        sceneKeypoints.delete();
+        points.delete();
+        decoded.delete();
         return [];
     }
 
-    // --- Stage 3: Spatial clustering ---
-    const scenePoints = goodMatches.map(m => m.scenePt);
-    const labels = dbscan(scenePoints, DETECTION.dbscan_eps, DETECTION.dbscan_min_samples);
-
-    // --- Stage 4: Per-cluster homography + crop ---
-    const clusterIds = [...new Set(labels.filter(l => l >= 0))].sort((a, b) => a - b);
+    // points.data32F contains all floats: N codes × 4 corners × 2 coords
+    const floats = points.data32F;
+    const numQR = floats.length / 8;  // 4 corners × 2 floats each
     const cards = [];
 
-    for (const clusterId of clusterIds) {
-        const clusterMatches = goodMatches.filter((_, i) => labels[i] === clusterId);
-        if (clusterMatches.length < 4) continue;
+    for (let q = 0; q < numQR; q++) {
+        const baseIdx = q * 8;
 
-        // Build point arrays for findHomography
-        const srcPts = cv.matFromArray(clusterMatches.length, 1, cv.CV_32FC2,
-            clusterMatches.flatMap(m => [m.refPt.x, m.refPt.y]));
-        const dstPts = cv.matFromArray(clusterMatches.length, 1, cv.CV_32FC2,
-            clusterMatches.flatMap(m => [m.scenePt.x, m.scenePt.y]));
-
-        // RANSAC homography
-        const mask = new cv.Mat();
-        const H = cv.findHomography(srcPts, dstPts, cv.RANSAC,
-            DETECTION.ransac_reproj_thresh, mask);
-
-        srcPts.delete();
-        dstPts.delete();
-
-        if (H.empty()) {
-            H.delete();
-            mask.delete();
-            continue;
-        }
-
-        // Count inliers
-        let inlierCount = 0;
-        for (let i = 0; i < mask.rows; i++) {
-            if (mask.data[i] !== 0) inlierCount++;
-        }
-        mask.delete();
-
-        if (inlierCount < DETECTION.min_inliers) {
-            H.delete();
-            continue;
-        }
-
-        // Transform QR corners to scene space
-        const qrCornersRef = [
-            [0, 0], [refWidth, 0],
-            [refWidth, refHeight], [0, refHeight],
+        const qrCorners = [
+            { x: floats[baseIdx + 0], y: floats[baseIdx + 1] },  // top-left
+            { x: floats[baseIdx + 2], y: floats[baseIdx + 3] },  // top-right
+            { x: floats[baseIdx + 4], y: floats[baseIdx + 5] },  // bottom-right
+            { x: floats[baseIdx + 6], y: floats[baseIdx + 7] },  // bottom-left
         ];
-        const qrCorners = transformPoints(qrCornersRef, H);
 
-        // Transform SKU corners to scene space
-        const sx = CARD_LAYOUT.sku_x * refWidth;
-        const sy = CARD_LAYOUT.sku_y * refHeight;
-        const sw = CARD_LAYOUT.sku_w * refWidth;
-        const sh = CARD_LAYOUT.sku_h * refHeight;
-        const skuCornersRef = [
-            [sx, sy], [sx + sw, sy],
-            [sx + sw, sy + sh], [sx, sy + sh],
-        ];
-        const skuCorners = transformPoints(skuCornersRef, H);
+        // Compute QR side length (average of top and left edges)
+        const topLen = Math.hypot(
+            qrCorners[1].x - qrCorners[0].x,
+            qrCorners[1].y - qrCorners[0].y,
+        );
+        const leftLen = Math.hypot(
+            qrCorners[3].x - qrCorners[0].x,
+            qrCorners[3].y - qrCorners[0].y,
+        );
+        const qrSize = (topLen + leftLen) / 2;
 
-        // Center = centroid of QR corners
-        const center = {
-            x: qrCorners.reduce((s, p) => s + p.x, 0) / 4,
-            y: qrCorners.reduce((s, p) => s + p.y, 0) / 4,
+        // Compute local coordinate axes from the detected corners.
+        // axisX: unit vector along the top edge (left → right)
+        // axisY: unit vector along the left edge (top → bottom)
+        const axisX = {
+            x: (qrCorners[1].x - qrCorners[0].x) / topLen,
+            y: (qrCorners[1].y - qrCorners[0].y) / topLen,
         };
+        const axisY = {
+            x: (qrCorners[3].x - qrCorners[0].x) / leftLen,
+            y: (qrCorners[3].y - qrCorners[0].y) / leftLen,
+        };
+
+        // SKU corners in scene space
+        const origin = qrCorners[0];
+        const skuCorners = computeSkuCorners(origin, axisX, axisY, qrSize);
 
         // Extract rectified SKU crop
         const skuCrop = extractCrop(sceneGray, skuCorners);
 
         cards.push({
-            homography: H,  // caller must .delete() after use
-            inlierCount,
-            center,
             qrCorners,
             skuCorners,
-            skuCrop,         // caller must .delete() after use
+            skuCrop,
+            decoded: decoded.size() > q ? decoded.get(q) : '',
         });
     }
 
     sceneGray.delete();
-    sceneKeypoints.delete();
+    points.delete();
+    decoded.delete();
 
     return cards;
 }
@@ -404,53 +322,55 @@ export function detect(sceneMat) {
 
 // --- Internal helpers ---
 
-function keypointToPoint(keypoints, idx) {
-    const kp = keypoints.get(idx);
-    return { x: kp.pt.x, y: kp.pt.y };
-}
-
 /**
- * Transform an array of [x, y] points through a 3x3 homography.
- * Returns array of {x, y} objects.
- */
-function transformPoints(pts, H) {
-    const src = cv.matFromArray(pts.length, 1, cv.CV_32FC2,
-        pts.flatMap(([x, y]) => [x, y]));
-    const dst = new cv.Mat();
-    cv.perspectiveTransform(src, dst, H);
-
-    const result = [];
-    for (let i = 0; i < pts.length; i++) {
-        result.push({
-            x: dst.floatAt(i, 0),
-            y: dst.floatAt(i, 1),
-        });
-    }
-    src.delete();
-    dst.delete();
-    return result;
-}
-
-/**
- * Extract a rectified crop of the SKU region.
+ * Compute the 4 SKU region corners in scene-image space.
  *
- * skuCorners: [{x,y} × 4] — the SKU quad in scene space.
- * Returns: cv.Mat (grayscale, crop_width × crop_height). Caller must delete.
+ * Uses the QR code's detected corners to establish a local coordinate
+ * frame, then places the SKU box according to CARD_LAYOUT offsets.
+ */
+function computeSkuCorners(origin, axisX, axisY, qrSize) {
+    const { sku_x, sku_y, sku_w, sku_h } = CARD_LAYOUT;
+
+    function toScene(lx, ly) {
+        return {
+            x: origin.x + (lx * qrSize) * axisX.x + (ly * qrSize) * axisY.x,
+            y: origin.y + (lx * qrSize) * axisX.y + (ly * qrSize) * axisY.y,
+        };
+    }
+
+    return [
+        toScene(sku_x,         sku_y),
+        toScene(sku_x + sku_w, sku_y),
+        toScene(sku_x + sku_w, sku_y + sku_h),
+        toScene(sku_x,         sku_y + sku_h),
+    ];
+}
+
+/**
+ * Extract a rectified crop of the SKU region via perspective warp.
+ *
+ * @param {cv.Mat} sceneGray - grayscale scene image
+ * @param {Array<{x,y}>} skuCorners - 4 corners in scene space
+ * @returns {cv.Mat} - grayscale thresholded crop. Caller must .delete().
  */
 function extractCrop(sceneGray, skuCorners) {
+    const { crop_width, crop_height } = CARD_LAYOUT;
+
     const srcQuad = cv.matFromArray(4, 1, cv.CV_32FC2,
         skuCorners.flatMap(p => [p.x, p.y]));
     const dstQuad = cv.matFromArray(4, 1, cv.CV_32FC2, [
         0, 0,
-        CARD_LAYOUT.crop_width, 0,
-        CARD_LAYOUT.crop_width, CARD_LAYOUT.crop_height,
-        0, CARD_LAYOUT.crop_height,
+        crop_width, 0,
+        crop_width, crop_height,
+        0, crop_height,
     ]);
 
     const M = cv.getPerspectiveTransform(srcQuad, dstQuad);
     const crop = new cv.Mat();
-    cv.warpPerspective(sceneGray, crop,
-        M, new cv.Size(CARD_LAYOUT.crop_width, CARD_LAYOUT.crop_height));
+    cv.warpPerspective(
+        sceneGray, crop, M,
+        new cv.Size(crop_width, crop_height),
+    );
 
     // Otsu threshold for clean OCR input
     const binary = new cv.Mat();
@@ -461,206 +381,16 @@ function extractCrop(sceneGray, skuCorners) {
     M.delete();
     crop.delete();
 
-    return binary;  // caller owns this Mat
+    return binary; // caller must .delete()
 }
 ```
 
----
-
-### 4.3 `clustering.js` — DBSCAN
-
-The only algorithm implemented from scratch. OpenCV.js does not expose
-a clustering API.
-
-```javascript
-/**
- * DBSCAN clustering on 2D points.
- *
- * @param {Array<{x: number, y: number}>} points
- * @param {number} eps - neighborhood radius in pixels
- * @param {number} minSamples - minimum cluster size
- * @returns {Int32Array} label per point (-1 = noise)
- */
-export function dbscan(points, eps, minSamples) {
-    const n = points.length;
-    const labels = new Int32Array(n).fill(-1);
-    const visited = new Uint8Array(n);
-    const epsSq = eps * eps;
-    let clusterId = 0;
-
-    function regionQuery(idx) {
-        const neighbors = [];
-        const p = points[idx];
-        for (let j = 0; j < n; j++) {
-            const dx = p.x - points[j].x;
-            const dy = p.y - points[j].y;
-            if (dx * dx + dy * dy <= epsSq) {
-                neighbors.push(j);
-            }
-        }
-        return neighbors;
-    }
-
-    for (let i = 0; i < n; i++) {
-        if (visited[i]) continue;
-        visited[i] = 1;
-
-        const neighbors = regionQuery(i);
-        if (neighbors.length < minSamples) continue;
-
-        labels[i] = clusterId;
-        const queue = [...neighbors];
-        let qi = 0;
-
-        while (qi < queue.length) {
-            const q = queue[qi++];
-            if (!visited[q]) {
-                visited[q] = 1;
-                const qNeighbors = regionQuery(q);
-                if (qNeighbors.length >= minSamples) {
-                    for (const nn of qNeighbors) {
-                        if (!queue.includes(nn)) queue.push(nn);
-                    }
-                }
-            }
-            if (labels[q] === -1) {
-                labels[q] = clusterId;
-            }
-        }
-        clusterId++;
-    }
-
-    return labels;
-}
-```
-
-**Performance note:** `queue.includes(nn)` is O(n) per call, making worst
-case O(n³). For hundreds of matches this is fine. If it becomes a problem,
-replace with a Set:
-
-```javascript
-const inQueue = new Uint8Array(n);
-// ...
-if (!inQueue[nn]) { queue.push(nn); inQueue[nn] = 1; }
-```
+**That's the entire detection pipeline.** ~150 lines including comments,
+replacing what was ~300+ lines with AKAZE + matching + DBSCAN + RANSAC.
 
 ---
 
-### 4.4 `tracker.js` — Cross-Frame Card Deduplication
-
-Prevents OCR from running on every frame for every card. Matches detected
-cards to previously-seen cards by spatial proximity.
-
-```javascript
-import { TRACKER } from './config.js';
-
-export class CardTracker {
-    constructor(config = TRACKER) {
-        this.mergeRadiusSq = config.merge_radius ** 2;
-        this.alpha = config.ema_alpha;
-        this.cards = new Map();  // id → TrackedCard
-        this.nextId = 0;
-    }
-
-    /**
-     * Update tracker with a newly detected card.
-     * Returns { id, isNew } where isNew means this card hasn't been seen before.
-     */
-    update(detectedCard) {
-        const { center } = detectedCard;
-
-        // Find closest known card
-        let bestId = null;
-        let bestDistSq = Infinity;
-
-        for (const [id, tracked] of this.cards) {
-            const dx = center.x - tracked.center.x;
-            const dy = center.y - tracked.center.y;
-            const distSq = dx * dx + dy * dy;
-            if (distSq < bestDistSq) {
-                bestDistSq = distSq;
-                bestId = id;
-            }
-        }
-
-        // Match to existing card if close enough
-        if (bestId !== null && bestDistSq < this.mergeRadiusSq) {
-            const tracked = this.cards.get(bestId);
-            // EMA smoothing on center position
-            tracked.center.x = tracked.center.x * (1 - this.alpha)
-                              + center.x * this.alpha;
-            tracked.center.y = tracked.center.y * (1 - this.alpha)
-                              + center.y * this.alpha;
-            tracked.framesSeen++;
-            tracked.lastSeen = performance.now();
-            return { id: bestId, isNew: false };
-        }
-
-        // Register new card
-        const id = this.nextId++;
-        this.cards.set(id, {
-            center: { ...center },
-            skuText: null,
-            ocrPending: false,
-            framesSeen: 1,
-            lastSeen: performance.now(),
-        });
-        return { id, isNew: true };
-    }
-
-    setText(id, text) {
-        const card = this.cards.get(id);
-        if (card) {
-            card.skuText = text;
-            card.ocrPending = false;
-        }
-    }
-
-    getText(id) {
-        return this.cards.get(id)?.skuText ?? null;
-    }
-
-    setOcrPending(id) {
-        const card = this.cards.get(id);
-        if (card) card.ocrPending = true;
-    }
-
-    isOcrNeeded(id) {
-        const card = this.cards.get(id);
-        return card && !card.skuText && !card.ocrPending;
-    }
-
-    /**
-     * Remove cards not seen for a given duration.
-     * Call periodically to prevent unbounded growth.
-     */
-    prune(maxAgeMs = 5000) {
-        const now = performance.now();
-        for (const [id, card] of this.cards) {
-            if (now - card.lastSeen > maxAgeMs) {
-                this.cards.delete(id);
-            }
-        }
-    }
-
-    /**
-     * Get all tracked cards with their current state.
-     * Useful for rendering the results table.
-     */
-    getAll() {
-        return [...this.cards.entries()].map(([id, card]) => ({
-            id,
-            center: card.center,
-            skuText: card.skuText,
-            framesSeen: card.framesSeen,
-        }));
-    }
-}
-```
-
----
-
-### 4.5 `ocr-worker.js` — Web Worker for Tesseract.js
+### 4.3 `ocr-worker.js` — Web Worker for Tesseract.js
 
 Runs OCR off the main thread so it doesn't block rendering.
 
@@ -682,11 +412,10 @@ const ready = initWorker();
 self.onmessage = async (event) => {
     await ready;
 
-    const { cardId, cropData, cropWidth, cropHeight } = event.data;
+    const { cardIndex, cropData, cropWidth, cropHeight } = event.data;
 
-    // cropData is a Uint8Array of grayscale pixels (from the thresholded Mat).
-    // Tesseract expects an image — convert to ImageData or a data URL.
-    // Since we have raw grayscale, expand to RGBA for Tesseract:
+    // cropData is a Uint8Array of grayscale pixels (thresholded).
+    // Expand to RGBA for Tesseract.
     const rgba = new Uint8ClampedArray(cropWidth * cropHeight * 4);
     for (let i = 0; i < cropData.length; i++) {
         const v = cropData[i];
@@ -696,7 +425,6 @@ self.onmessage = async (event) => {
         rgba[i * 4 + 3] = 255;
     }
 
-    // Create ImageData and convert to a blob URL for Tesseract
     const canvas = new OffscreenCanvas(cropWidth, cropHeight);
     const ctx = canvas.getContext('2d');
     ctx.putImageData(new ImageData(rgba, cropWidth, cropHeight), 0, 0);
@@ -705,7 +433,7 @@ self.onmessage = async (event) => {
     const { data: { text } } = await worker.recognize(blob);
 
     self.postMessage({
-        cardId,
+        cardIndex,
         text: text.trim(),
     });
 };
@@ -713,98 +441,36 @@ self.onmessage = async (event) => {
 
 ---
 
-### 4.6 Overlay Rendering
+## 5. OpenCV.js Memory Management
 
-In `app.js` or a separate `renderer.js`. Draws on a `<canvas>` positioned
-over the video feed.
+Every `cv.Mat` must be explicitly `.delete()`d. OpenCV.js allocates on
+the WASM heap; the JS garbage collector does not track these allocations.
 
-```javascript
-function drawOverlays(cards, tracker) {
-    overlay.clearRect(0, 0, width, height);
+**In the frame loop, delete ALL Mats created during that frame.**
+A 720p RGBA Mat is ~3.7MB. Leaking one per frame exhausts the WASM
+heap in seconds.
 
-    for (const card of cards) {
-        // QR bounding quad (green)
-        drawQuad(overlay, card.qrCorners, '#00ff00', 2);
-
-        // SKU region quad (blue)
-        drawQuad(overlay, card.skuCorners, '#4488ff', 2);
-
-        // SKU text label (if OCR has completed)
-        const { id } = tracker.update(card);  // re-lookup
-        const text = tracker.getText(id);
-        if (text) {
-            const { x, y } = card.center;
-            overlay.fillStyle = '#ffffff';
-            overlay.font = '16px monospace';
-            overlay.fillText(text, x - 30, y - 30);
-        }
-    }
-}
-
-function drawQuad(ctx, corners, color, lineWidth) {
-    ctx.strokeStyle = color;
-    ctx.lineWidth = lineWidth;
-    ctx.beginPath();
-    ctx.moveTo(corners[0].x, corners[0].y);
-    for (let i = 1; i < corners.length; i++) {
-        ctx.lineTo(corners[i].x, corners[i].y);
-    }
-    ctx.closePath();
-    ctx.stroke();
-}
-```
-
----
-
-## 5. OpenCV.js Memory Management Rules
-
-This is the most likely source of bugs. OpenCV.js uses Emscripten's
-WASM heap. JS garbage collection does NOT apply to cv.Mat objects.
-
-**Rule 1:** Every `new cv.Mat()`, `cv.matFromArray()`, `cv.matFromImageData()`,
-or OpenCV function that returns a Mat must have a corresponding `.delete()`.
-
-**Rule 2:** OpenCV functions that take an output Mat parameter (like
-`cv.cvtColor(src, dst, ...)`) allocate internally if dst is empty.
-You still own dst and must delete it.
-
-**Rule 3:** `cv.KeyPointVector` and `cv.DMatchVectorVector` also need
-`.delete()`.
-
-**Rule 4:** In the frame loop, delete ALL Mats created during that frame
-before the next `requestAnimationFrame`. A 720p RGBA Mat is ~3.7MB.
-At 30fps, leaking one per frame exhausts the WASM heap in seconds.
-
-**Practical pattern:**
-
-```javascript
-function processFrame() {
-    const mats = [];  // track all Mats created this frame
-
-    const scene = cv.matFromImageData(imageData);
-    mats.push(scene);
-
-    const gray = new cv.Mat();
-    mats.push(gray);
-    cv.cvtColor(scene, gray, cv.COLOR_RGBA2GRAY);
-
-    // ... pipeline ...
-
-    // Cleanup everything
-    for (const m of mats) m.delete();
-
-    requestAnimationFrame(processFrame);
-}
-```
-
-Or use a helper:
+Use a pool helper to make this less error-prone:
 
 ```javascript
 class MatPool {
     constructor() { this.mats = []; }
     track(mat) { this.mats.push(mat); return mat; }
-    flush() { for (const m of this.mats) m.delete(); this.mats = []; }
+    flush() {
+        for (const m of this.mats) {
+            try { m.delete(); } catch {}
+        }
+        this.mats = [];
+    }
 }
+
+// Usage in frame loop:
+const pool = new MatPool();
+const scene = pool.track(cv.matFromImageData(imageData));
+const gray = pool.track(new cv.Mat());
+cv.cvtColor(scene, gray, cv.COLOR_RGBA2GRAY);
+// ... use gray ...
+pool.flush(); // cleans up everything
 ```
 
 ---
@@ -844,23 +510,25 @@ async function waitForOpenCV() {
 the WASM runtime finishes compiling, typically 1-3 seconds on modern
 hardware.
 
-**Verifying the build includes AKAZE:**
+**Verifying the build includes QRCodeDetector:**
 
-After loading, check `typeof cv.AKAZE` in the browser console. If it's
-`"undefined"`, the build doesn't include the `features2d` module and
-you'll need to fall back to `cv.ORB` (always included) or use a custom
-build. The `@techstark` builds include `features2d`.
+After loading, check in the console:
+```javascript
+console.log(typeof cv.QRCodeDetector);  // should be "function"
+```
+
+`QRCodeDetector` is in the `objdetect` module, which is included in
+the default `@techstark` builds.
 
 **Custom build (optional, for smaller bundle):**
 
 ```bash
 python platforms/js/build_js.py build_js \
     --build_wasm \
-    --cmake_option="-DBUILD_LIST=features2d,calib3d,imgproc"
+    --cmake_option="-DBUILD_LIST=objdetect,calib3d,imgproc"
 ```
 
-Strips video I/O, objdetect, photo, etc. and cuts the bundle to ~2-3MB.
-Self-host the resulting `opencv.js` and reference it directly.
+Strips everything except what you need. Self-host the output.
 
 ---
 
@@ -882,11 +550,7 @@ Self-host the resulting `opencv.js` and reference it directly.
     </div>
 
     <div id="controls">
-        <label>
-            Reference QR:
-            <input type="file" id="ref-input" accept="image/*">
-        </label>
-        <button id="start-btn" disabled>Start Detection</button>
+        <button id="capture-btn">Capture & Read</button>
     </div>
 
     <div id="results">
@@ -896,7 +560,7 @@ Self-host the resulting `opencv.js` and reference it directly.
                 <tr>
                     <th>Card #</th>
                     <th>SKU</th>
-                    <th>Confidence</th>
+                    <th>QR Content</th>
                 </tr>
             </thead>
             <tbody></tbody>
@@ -921,64 +585,102 @@ The overlay canvas sits on top of the video with `pointer-events: none`.
 
 ---
 
-## 8. Performance Budget
+## 8. Preprocessing for Difficult Conditions
 
-| Stage               | Expected Time (720p) | Notes                                     |
-| ------------------- | -------------------- | ----------------------------------------- |
-| AKAZE extraction    | 50–100ms             | Biggest cost. Reduce input res if needed. |
-| knnMatch            | 10–20ms              | Hamming, hardware-accelerated in WASM.    |
-| Ratio test + DBSCAN | <5ms                 | Trivial at match counts <1000.            |
-| findHomography ×N   | 2–5ms per card       | RANSAC is fast on small point sets.       |
-| warpPerspective ×N  | <1ms per card        | Small output crop.                        |
-| **Total**           | **70–140ms**         | **~7–14 fps**                             |
+If `detectMulti` struggles with plastic bags or poor lighting, apply
+preprocessing to the grayscale image before detection:
 
-OCR (Tesseract.js) takes 100–500ms per crop but runs asynchronously in
-a Worker and only fires once per new card. It does not affect frame rate.
+```javascript
+function preprocess(gray) {
+    // 1. Gaussian blur to smooth plastic bag texture
+    const blurred = new cv.Mat();
+    cv.GaussianBlur(gray, blurred, new cv.Size(3, 3), 0);
 
-If the frame budget is too tight, process every Nth frame and interpolate
-bounding box positions between detections using the tracker's EMA.
+    // 2. CLAHE for local contrast enhancement
+    const clahe = new cv.CLAHE(2.0, new cv.Size(8, 8));
+    const enhanced = new cv.Mat();
+    clahe.apply(blurred, enhanced);
+
+    blurred.delete();
+    return enhanced; // caller must .delete()
+}
+```
+
+Try detection on the raw grayscale first. Only add preprocessing if
+needed — it costs ~5-10ms per frame.
 
 ---
 
-## 9. Deployment
+## 9. Performance Budget
+
+| Stage                   | Expected Time (720p) | Notes                  |
+| ----------------------- | -------------------- | ---------------------- |
+| detectAndDecodeMulti    | 20–50ms              | Scales with QR count   |
+| getPerspectiveTransform | <1ms per card        | 4-point exact solution |
+| warpPerspective         | <1ms per card        | Small output crop      |
+| threshold (Otsu)        | <1ms per card        | On the small crop      |
+| **Total**               | **25–60ms**          | **~16–40 fps**         |
+
+This is dramatically faster than AKAZE (~100ms+ just for extraction).
+
+OCR (Tesseract.js) takes 100–500ms per crop but runs asynchronously in
+a Worker. It does not affect frame rate.
+
+---
+
+## 10. Deployment
 
 Static files only. Any static hosting works.
 
 ```bash
-# GitHub Pages (from your existing fc.aidenvoth.com setup)
+# Local dev with Bun
+bun --serve .
+
+# GitHub Pages
 git add .
 git commit -m "add SKU reader"
 git push
-
-# Or any static server for local dev
-npx serve .
-# or
-python3 -m http.server 8080
 ```
 
-No build step required unless you opt for a JS bundler. The app is
-vanilla JS with ES modules. OpenCV.js is loaded as a script tag.
+No build step required. The app is vanilla JS with ES modules.
+OpenCV.js and Tesseract.js are loaded from CDN.
+
+For intellisense during development:
+```bash
+bun init
+bun add -d @techstark/opencv-js
+```
+
+Add a `jsconfig.json`:
+```json
+{
+    "compilerOptions": {
+        "checkJs": true,
+        "target": "es2022",
+        "module": "es2022"
+    },
+    "include": ["js/**/*.js"]
+}
+```
+
+Add `/// <reference types="@techstark/opencv-js" />` at the top of
+files that use OpenCV for autocomplete.
 
 ---
 
-## 10. Test Plan
+## 11. Test Plan
 
-| Test                                             | Method                                       |
-| ------------------------------------------------ | -------------------------------------------- |
-| DBSCAN produces correct clusters                 | Unit test with known point layouts           |
-| DBSCAN handles noise correctly                   | Points farther than eps → label -1           |
-| Tracker deduplicates same card across frames     | Feed same center 10× → one id                |
-| Tracker registers new card at different position | Feed two centers → two ids                   |
-| Tracker prunes stale cards                       | Feed one center, wait, prune → empty         |
-| Detection finds QR in clean image                | Load test image, verify card count           |
-| Detection handles no-QR scene                    | Load image without QR → empty results        |
-| Homography is reasonable                         | Check reprojected corners form a convex quad |
-| Crop extraction produces readable output         | Save crop, manually verify                   |
-| OCR reads known SKU correctly                    | Feed crop of known SKU → match text          |
-| Memory doesn't leak during frame loop            | Monitor WASM heap over 60s                   |
+| Test                                             | Method                                   |
+| ------------------------------------------------ | ---------------------------------------- |
+| QR detection finds codes in clean image          | Load test image, verify card count       |
+| QR detection handles no-QR scene                 | Load plain image → empty results         |
+| SKU corners are correctly positioned             | Draw skuCorners overlay, verify visually |
+| Crop extraction produces readable output         | Save crop, verify text is axis-aligned   |
+| OCR reads known SKU correctly                    | Feed crop of known SKU → match text      |
+| Memory doesn't leak during frame loop            | Monitor WASM heap over 60s               |
+| Preprocessing improves detection through plastic | Compare detect count with/without        |
+| Export CSV produces valid output                 | Click export, open file, check format    |
 
-**Synthetic integration test:** Programmatically create a scene image by
-applying known affine transforms to the reference QR image (paste 3 copies
-at known positions/rotations onto a white background). Run detection.
-Verify correct card count and that recovered QR corners match the known
-transforms within 5px tolerance.
+**Synthetic test:** Print a QR code several times on a sheet of paper with
+SKU labels in known positions. Photograph it. Run detection. Verify correct
+count and that OCR reads the expected SKUs.
