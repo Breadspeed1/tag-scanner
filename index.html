@@ -5,18 +5,67 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>QR SKU Reader</title>
     <link rel="stylesheet" href="style.css">
-    <script type="module">
-        document.addEventListener('alpine:init', () => {
-            console.log('alpine loaded');
-        })
-    </script>
-    <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js"></script>
 </head>
 <body>
 
-    <!-- OpenCV.js -->
+    <header>
+        <h1>QR SKU Reader</h1>
+        <p class="subtitle">Detects QR fiducials in a scene image and reads SKU text via OCR</p>
+    </header>
+
+    <main>
+        <section id="controls">
+            <div class="input-row">
+                <div class="input-group">
+                    <label for="ref-input">Reference QR Image</label>
+                    <input type="file" id="ref-input" accept="image/*">
+                    <div class="preview-box">
+                        <img id="ref-preview" hidden alt="Reference QR preview">
+                        <span class="preview-placeholder" id="ref-placeholder">No image loaded</span>
+                    </div>
+                </div>
+
+                <div class="input-group">
+                    <label for="scene-input">Scene Image</label>
+                    <input type="file" id="scene-input" accept="image/*">
+                    <p class="input-hint">Upload a photo containing one or more cards with QR codes.</p>
+                </div>
+            </div>
+
+            <div class="action-row">
+                <button id="detect-btn" disabled>Run Detection</button>
+                <span id="status" class="status"></span>
+            </div>
+        </section>
+
+        <section id="canvas-container" hidden>
+            <h2>Scene</h2>
+            <div class="canvas-wrapper">
+                <canvas id="scene-canvas"></canvas>
+                <canvas id="overlay-canvas"></canvas>
+            </div>
+        </section>
+
+        <section id="results" hidden>
+            <div class="results-header">
+                <h2>Detected Cards</h2>
+                <button id="export-btn">Export CSV</button>
+            </div>
+            <table id="results-table">
+                <thead>
+                    <tr>
+                        <th>Card</th>
+                        <th>SKU</th>
+                    </tr>
+                </thead>
+                <tbody></tbody>
+            </table>
+        </section>
+    </main>
+
+    <!-- OpenCV.js (WASM embedded, no separate .wasm needed) -->
     <script async
-    src="https://cdn.jsdelivr.net/npm/@techstark/opencv-js@4.10.0-release.1/dist/opencv.js">
+        src="https://cdn.jsdelivr.net/npm/@techstark/opencv-js@4.10.0-release.1/dist/opencv.js">
     </script>
 
     <!-- App (ES modules) -->

@@ -22,4 +22,9 @@ export const CARD_LAYOUT = {
     crop_height: 100,
 };
 
+export const TRACKER = {
+    merge_radius: 60,       // px — max distance to consider same card
+    ema_alpha: 0.2,         // smoothing factor for center position
+};
+
 export const OCR_WHITELIST = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-'
