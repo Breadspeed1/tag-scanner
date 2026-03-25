@@ -4,5 +4,15 @@ async function waitForOpenCV() {
     }
 }
 
-await waitForOpenCV();
-console.log('OpenCV ready:', typeof cv.Mat);
+let refFeatures = null;
+let ocrWorker = null;
+
+async function start() {
+    await waitForOpenCV();
+    console.log('opencv ready');
+
+
+}
+
+
+start()
