@@ -5,8 +5,15 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>QR SKU Reader</title>
     <link rel="stylesheet" href="style.css">
+
+    <!--
+        app.js MUST come before Alpine so our alpine:init listener is registered
+        before Alpine fires the event. Both are deferred and execute in document order.
+    -->
+    <script type="module" src="js/app.js"></script>
+    <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js"></script>
 </head>
-<body>
+<body x-data="scanner" x-cloak>
 
     <header>
         <h1>QR SKU Reader</h1>
@@ -14,31 +21,37 @@
     </header>
 
     <main>
-        <section id="controls">
+
+        <!-- Controls -->
+        <section class="card" id="controls">
             <div class="input-row">
                 <div class="input-group">
-                    <label for="ref-input">Reference QR Image</label>
-                    <input type="file" id="ref-input" accept="image/*">
+                    <label>Reference QR Image</label>
+                    <input type="file" accept="image/*" @change="onRefChange($event)">
                     <div class="preview-box">
-                        <img id="ref-preview" hidden alt="Reference QR preview">
-                        <span class="preview-placeholder" id="ref-placeholder">No image loaded</span>
+                        <img :src="refPreviewSrc" x-show="refLoaded" alt="Reference QR preview">
+                        <span class="preview-placeholder" x-show="!refLoaded">No image loaded</span>
                     </div>
                 </div>
 
                 <div class="input-group">
-                    <label for="scene-input">Scene Image</label>
-                    <input type="file" id="scene-input" accept="image/*">
-                    <p class="input-hint">Upload a photo containing one or more cards with QR codes.</p>
+                    <label>Scene Image</label>
+                    <input type="file" accept="image/*" @change="onSceneChange($event)">
+                    <p class="input-hint">Upload a photo containing cards with QR codes.</p>
                 </div>
             </div>
 
             <div class="action-row">
-                <button id="detect-btn" disabled>Run Detection</button>
-                <span id="status" class="status"></span>
+                <button @click="runDetection" :disabled="!canDetect">
+                    <span x-show="!detecting">Run Detection</span>
+                    <span x-show="detecting">Detecting…</span>
+                </button>
+                <span class="status-badge" :class="statusLevel" x-text="status" x-show="status"></span>
             </div>
         </section>
 
-        <section id="canvas-container" hidden>
+        <!-- Scene canvas -->
+        <section class="card" x-show="sceneLoaded">
             <h2>Scene</h2>
             <div class="canvas-wrapper">
                 <canvas id="scene-canvas"></canvas>
@@ -46,21 +59,93 @@
             </div>
         </section>
 
-        <section id="results" hidden>
+        <!-- Results table -->
+        <section class="card" x-show="cards.length > 0">
             <div class="results-header">
                 <h2>Detected Cards</h2>
-                <button id="export-btn">Export CSV</button>
+                <button class="secondary" @click="exportCSV">Export CSV</button>
             </div>
             <table id="results-table">
                 <thead>
                     <tr>
-                        <th>Card</th>
+                        <th>#</th>
                         <th>SKU</th>
+                        <th>Inliers</th>
                     </tr>
                 </thead>
-                <tbody></tbody>
+                <tbody>
+                    <template x-for="(card, i) in cards" :key="i">
+                        <tr>
+                            <td x-text="i + 1"></td>
+                            <td>
+                                <span x-show="card.text" x-text="card.text" class="sku-text"></span>
+                                <span x-show="!card.text && card.pending" class="sku-pending">Reading…</span>
+                                <span x-show="!card.text && !card.pending && card.text !== ''" class="sku-empty">—</span>
+                            </td>
+                            <td x-text="card.inlierCount" class="col-inliers"></td>
+                        </tr>
+                    </template>
+                </tbody>
             </table>
         </section>
+
+        <!-- Debug images -->
+        <section class="card" x-show="debugVisible">
+            <h2>Debug</h2>
+            <div class="debug-grid">
+
+                <div class="debug-item">
+                    <p class="debug-label">
+                        Reference keypoints
+                        <span class="debug-count" x-text="`(${debugStats.refPoints})`"></span>
+                    </p>
+                    <canvas id="debug-ref-kp" class="debug-canvas"></canvas>
+                </div>
+
+                <div class="debug-item">
+                    <p class="debug-label">
+                        Scene keypoints
+                        <span class="debug-count" x-text="`(${debugStats.scenePoints})`"></span>
+                    </p>
+                    <canvas id="debug-scene-kp" class="debug-canvas"></canvas>
+                </div>
+
+                <div class="debug-item">
+                    <p class="debug-label">
+                        Good matches after Lowe ratio test
+                        <span class="debug-count" x-text="`(${debugStats.goodMatches})`"></span>
+                    </p>
+                    <canvas id="debug-matches" class="debug-canvas"></canvas>
+                </div>
+
+                <div class="debug-item">
+                    <p class="debug-label">
+                        DBSCAN clusters
+                        <span class="debug-count" x-text="`(${debugStats.clusters} cluster${debugStats.clusters !== 1 ? 's' : ''}, grey = noise)`"></span>
+                    </p>
+                    <canvas id="debug-clusters" class="debug-canvas"></canvas>
+                </div>
+
+            </div>
+        </section>
+
+        <!-- Log -->
+        <section class="card" id="log-section">
+            <div class="log-header" @click="logsOpen = !logsOpen">
+                <h2>Log <span class="log-count" x-text="logs.length > 0 ? `(${logs.length})` : ''"></span></h2>
+                <span class="chevron" x-text="logsOpen ? '▲' : '▼'"></span>
+            </div>
+            <div class="log-list" x-show="logsOpen" x-transition>
+                <div x-show="logs.length === 0" class="log-empty">No entries yet.</div>
+                <template x-for="(entry, i) in logs" :key="i">
+                    <div class="log-entry" :class="entry.level">
+                        <span class="log-time" x-text="entry.time"></span>
+                        <span class="log-msg" x-text="entry.msg"></span>
+                    </div>
+                </template>
+            </div>
+        </section>
+
     </main>
 
     <!-- OpenCV.js (WASM embedded, no separate .wasm needed) -->
@@ -68,7 +153,5 @@
         src="https://cdn.jsdelivr.net/npm/@techstark/opencv-js@4.10.0-release.1/dist/opencv.js">
     </script>
 
-    <!-- App (ES modules) -->
-    <script type="module" src="js/app.js"></script>
 </body>
 </html>

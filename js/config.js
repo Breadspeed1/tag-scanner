@@ -1,3 +1,11 @@
+// Display canvas max dimension — keeps the UI fast.
+export const MAX_SCENE_DIM = 1280;
+
+// Detection max dimension — AKAZE's pyramid can exhaust the WASM heap on full-res
+// phone photos. 1920px is the sweet spot: large enough for feature matching,
+// small enough to stay within the ~256MB WASM heap. Never attempt full resolution.
+export const MAX_DETECT_DIM = 1920;
+
 export const DETECTION = {
     akaze_threshold: 0.001,
     lowe_ratio: 0.75,
