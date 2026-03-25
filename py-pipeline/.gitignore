@@ -1,0 +1,5 @@
+sweep_results/
+debug/
+.venv/
+__pycache__/
+*.pyc
