@@ -6,9 +6,9 @@ export const CARD_LAYOUT = {
     // Measure from a physical card: how far is the SKU text from the QR,
     // expressed as multiples of the QR side length?
     sku_x: -1.5,    // left edge relative to QR left
-    sku_y: 1.4,    // top edge below QR (1.1 = just below the code)
-    sku_w: 2.5,    // width in QR-side-lengths
-    sku_h: 0.3,    // height in QR-side-lengths
+    sku_y: 1,    // top edge below QR (1.1 = just below the code)
+    sku_w: 2.6,    // width in QR-side-lengths
+    sku_h: 0.5,    // height in QR-side-lengths
 
     // Output crop resolution in pixels.
     crop_width: 300,
