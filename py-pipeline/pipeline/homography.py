@@ -18,7 +18,12 @@ def compute_sku_corners(qr_corners, sku_x, sku_y, sku_w, sku_h):
     return sku_img.reshape(4, 2)
 
 
-def extract_crop(img, sku_corners, crop_w=300, crop_h=100):
+def extract_crop(img, sku_corners, crop_w=300, crop_h=100, pad_frac=0.1):
+    # Expand corners outward by pad_frac to be less sensitive to corner errors
+    if pad_frac > 0:
+        center = sku_corners.mean(axis=0)
+        sku_corners = center + (sku_corners - center) * (1 + pad_frac)
+
     dst = np.float32([
         [0, 0],
         [crop_w, 0],

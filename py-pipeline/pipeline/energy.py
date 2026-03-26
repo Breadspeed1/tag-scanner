@@ -3,9 +3,18 @@ import numpy as np
 
 
 def compute_energy_map(gray, kernel_size=61):
-    laplacian = cv2.Laplacian(gray, cv2.CV_32F)
-    squared = laplacian * laplacian
-    energy = cv2.blur(squared, ksize=(kernel_size, kernel_size))
+    # Bidirectional gradient: high only where there's texture in BOTH x and y
+    # This finds QR codes (2D checkerboard) and suppresses barcodes (1D) and glare
+    sobel_x = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+    sobel_y = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
+
+    # Blur each gradient independently first to get local directional energy
+    gx = cv2.blur(sobel_x * sobel_x, ksize=(kernel_size, kernel_size))
+    gy = cv2.blur(sobel_y * sobel_y, ksize=(kernel_size, kernel_size))
+
+    # Geometric mean: high only when BOTH directions have energy
+    energy = np.sqrt(gx * gy)
+
     cv2.normalize(energy, energy, 0, 255, cv2.NORM_MINMAX)
     return energy.astype(np.uint8)
 
