@@ -130,16 +130,18 @@ def estimate_bar_angle(gray_crop):
     return -grad_angle
 
 
-def decode_candidate(gray, candidate, pad=150, min_crop_size=300):
-    """Crop a candidate region, deskew using structure tensor, try decoding."""
+def _try_decode_crop(gray, candidate, pad, min_crop_size, offset=(0, 0)):
+    """Try to decode a barcode from a padded crop around a candidate.
+    Returns (detections_list, success_bool)."""
     h, w = gray.shape
     bx, by, bw, bh = candidate['bbox']
+    dx, dy = offset
 
-    # Pad the crop
-    x0 = max(0, bx - pad)
-    y0 = max(0, by - pad)
-    x1 = min(w, bx + bw + pad)
-    y1 = min(h, by + bh + pad)
+    # Pad the crop (with optional offset for jittering)
+    x0 = max(0, bx - pad + dx)
+    y0 = max(0, by - pad + dy)
+    x1 = min(w, bx + bw + pad + dx)
+    y1 = min(h, by + bh + pad + dy)
     crop = gray[y0:y1, x0:x1]
 
     # Upscale small crops
@@ -204,11 +206,31 @@ def decode_candidate(gray, candidate, pad=150, min_crop_size=300):
                 all_dets.append(det)
 
             if all_dets:
-                break
+                return all_dets
         if all_dets:
-            break
+            return all_dets
 
     return all_dets
+
+
+def decode_candidate(gray, candidate, pad=150, min_crop_size=300):
+    """Crop a candidate region, deskew using structure tensor, try decoding.
+    If the primary crop fails, jitters the crop position to handle
+    cases where small shifts in centering affect decode success."""
+    # Primary attempt
+    dets = _try_decode_crop(gray, candidate, pad, min_crop_size)
+    if dets:
+        return dets
+
+    # Jitter: try shifted crop positions
+    jitter = 20
+    for dx, dy in [(-jitter, 0), (jitter, 0), (0, -jitter), (0, jitter),
+                   (-jitter, -jitter), (jitter, -jitter), (-jitter, jitter), (jitter, jitter)]:
+        dets = _try_decode_crop(gray, candidate, pad, min_crop_size, offset=(dx, dy))
+        if dets:
+            return dets
+
+    return []
 
 
 # --- Deduplication ---
@@ -244,6 +266,8 @@ def deduplicate_by_blob(candidates, all_detections_per_candidate):
 def tiled_fallback(gray, existing_centers, grid=(6, 6), overlap=0.3, radius=150):
     """Scan all tiles with rotation, dedup against existing detections."""
     
+    return []
+
     h, w = gray.shape
     rows, cols = grid
     tile_h, tile_w = h // rows, w // cols
